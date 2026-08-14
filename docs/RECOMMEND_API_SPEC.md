@@ -117,3 +117,30 @@ FastAPI는 계산만 하고, 아래 저장은 Spring이 담당한다.
 - [ ] `candidate_recipes`를 매 요청마다 Spring이 전부 조회해서 넘길지, 아니면 캐싱할지 결정
 - [ ] `conditions`(간단하게/맵지 않게 등)를 실제 스코어링에 반영할지, 지금은 무시하고 로그용으로만 저장할지 결정
 - [x] 비로그인 사용자도 추천 가능 — FastAPI 요청에는 애초에 `user_id`가 없어서 추가 작업 불필요. Spring이 `recommend_logs.user_id`를 `NULL`로 저장하면 끝 (컬럼이 nullable)
+- [ ] **비로그인 사용자의 "선택하기"도 허용 — DB 스키마 수정 필요 (팀 승인 대기)**
+
+  **확정된 제품 요구사항**: 회원 게시판 글 조회를 제외하면, 추천 결과 열람뿐 아니라 **선택하기까지 비로그인 상태로 가능해야 함**.
+
+  **현재 문제**: `chef_selections.user_id`가 `NOT NULL`이고 `(recommend_log_id, user_id)` 복합 FK로 `recommend_logs`를 참조함 → 비로그인 요청은 `recommend_logs.user_id`가 `NULL`이라 이 복합 FK를 만족시킬 방법이 없어서, 선택 저장 자체가 불가능함.
+
+  **제안하는 스키마 변경** (Railway DB에는 아직 미적용, 팀 동의 후 진행 예정):
+  ```sql
+  -- user_id를 NULL 허용으로 변경
+  ALTER TABLE chef_selections MODIFY user_id BIGINT UNSIGNED NULL;
+
+  -- 기존 복합 FK(recommend_log_id + user_id) 제거
+  ALTER TABLE chef_selections DROP FOREIGN KEY fk_chef_selections_log_user;
+
+  -- recommend_log_id 단독 FK로 재생성 (무결성은 이걸로 계속 보장)
+  ALTER TABLE chef_selections
+    ADD CONSTRAINT fk_chef_selections_log
+    FOREIGN KEY (recommend_log_id) REFERENCES recommend_logs (recommend_log_id)
+    ON DELETE RESTRICT;
+
+  -- user_id는 있을 때만 회원 테이블과 연결 (NULL이면 체크 스킵)
+  ALTER TABLE chef_selections
+    ADD CONSTRAINT fk_chef_selections_user
+    FOREIGN KEY (user_id) REFERENCES users (user_id)
+    ON DELETE SET NULL;
+  ```
+  이 변경으로 로그인 여부와 무관하게 `recommend_log_id`만 유효하면 선택이 저장되고, 로그인한 사용자는 `user_id`도 함께 남아 추적 가능해진다.

@@ -27,7 +27,8 @@ class CandidateRecipe(BaseModel):
 
 class RecommendRequest(BaseModel):
     raw_ingredients_text: str  # 사용자가 입력한 자연어 원문. 예: "계란 2개랑 김치 200g"
-    meal_time: str  # BREAKFAST | LUNCH | DINNER | LATE_NIGHT
+    # 선택값. Spring이 이미 이 값으로 후보를 걸러서 넘겨주므로 FastAPI 로직에서는 안 쓰이고, 그대로 응답에도 없음.
+    meal_time: str | None = None  # BREAKFAST | LUNCH | DINNER | LATE_NIGHT
     conditions: list[str] = []  # "간단하게" 등 조건 태그 (지금은 로직에 미반영, 로그용)
     exclude_ingredients: list[str] = []  # 알레르기 등으로 제외할 재료
     # 새로고침("다른 메뉴 보기") 시, 셰프별로 이미 보여준 recipe_id를 넘겨받아 다음 후보를 뽑는 데 사용
