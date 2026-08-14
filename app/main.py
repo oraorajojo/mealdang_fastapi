@@ -3,6 +3,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config.settings import settings
+from app.routers import recommend as recommend_router
 
 # FastAPI 앱 생성
 app = FastAPI(
@@ -20,7 +21,8 @@ app.add_middleware(
     allow_headers=["*"]
 )
 
-# 라우터 등록 자리 (준비되면 app.include_router(...) 추가)
+# 라우터 등록
+app.include_router(recommend_router.router)
 
 # 홈 경로
 @app.get("/", summary="api root")
