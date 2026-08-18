@@ -25,15 +25,26 @@ class CandidateRecipe(BaseModel):
     image_url: str | None = None
     ingredients: list[str]
 
+class IngredientDictionaryEntry(BaseModel):
+    """Spring이 ingredients + ingredient_aliases를 합쳐서 넘겨주는 재료 인식 사전 1건.
+    표준 재료명 자기 자신도 term으로 포함해서 보낸다 (예: 계란 자체도 term="계란").
+    별칭은 term=별칭, canonical_name=표준명으로 별도 항목이 된다 (예: term="달걀", canonical_name="계란")."""
+    term: str
+    ingredient_id: int
+    canonical_name: str
+
 class RecommendRequest(BaseModel):
     raw_ingredients_text: str  # 사용자가 입력한 자연어 원문. 예: "계란 2개랑 김치 200g"
     # 선택값. Spring이 이미 이 값으로 후보를 걸러서 넘겨주므로 FastAPI 로직에서는 안 쓰이고, 그대로 응답에도 없음.
     meal_time: str | None = None  # BREAKFAST | LUNCH | DINNER | LATE_NIGHT
-    conditions: list[str] = []  # "간단하게" 등 조건 태그 (지금은 로직에 미반영, 로그용)
+    conditions: list[str] = []  # 자유 태그. 지금은 로직에 미반영, 로그용
     exclude_ingredients: list[str] = []  # 알레르기 등으로 제외할 재료
     # 새로고침("다른 메뉴 보기") 시, 셰프별로 이미 보여준 recipe_id를 넘겨받아 다음 후보를 뽑는 데 사용
     exclude_recipe_ids: dict[str, list[int]] = {"KOREAN": [], "CHINESE": [], "WESTERN": []}
     candidate_recipes: list[CandidateRecipe]
+    # DB의 ingredients + ingredient_aliases 전체(또는 필요한 범위)를 Spring이 매 요청마다 실어 보낸다.
+    # FastAPI는 DB에 접근하지 않으므로, 재료 인식 사전의 최신 상태를 유지하는 책임은 Spring 쪽에 있다.
+    ingredient_dictionary: list[IngredientDictionaryEntry] = []
 
 class RecipeResult(BaseModel):
     recipe_id: int
@@ -50,6 +61,7 @@ class RecipeResult(BaseModel):
 
 class RecommendResponse(BaseModel):
     parsed_ingredients: list[str]  # 원문에서 뽑아낸 표준 재료명 목록
+    normalized_ingredient_ids: list[int]  # 위 재료명에 대응하는 ingredients.ingredient_id 목록 (parsed_ingredients와 같은 순서)
     portion_hint: str | None
     results: dict[str, RecipeResult | None]  # 셰프별 추천 결과. 후보가 없으면 None
 
@@ -61,18 +73,11 @@ class RecommendResponse(BaseModel):
 #   NNG = 일반명사, SN = 숫자, NNB = 의존명사(단위: 개/g/등), JC = 접속조사
 # 조사("랑", "은", "밖에" 등)가 자동으로 분리되기 때문에, 정규식으로 조사를 걷어낼 필요가 없다.
 #
-# TODO: 지금은 자주 쓰는 재료 위주로만 사전을 들고 있음.
-# DB의 ingredients/ingredient_aliases 전체(예: "달걀"->"계란" 같은 별칭)를 반영하려면,
-# Spring이 이 사전을 요청에 함께 넘겨주는 방식으로 확장 필요.
-INGREDIENT_ALIASES = {
-    "계란": "계란", "달걀": "계란", "김치": "김치", "참치": "참치", "참치캔": "참치",
-    "햄": "햄", "스팸": "햄", "두부": "두부", "밥": "밥", "식빵": "식빵",
-    "치즈": "치즈", "라면": "라면", "만두": "만두", "양파": "양파", "대파": "대파",
-    "당근": "당근", "감자": "감자", "돼지고기": "돼지고기", "소고기": "소고기",
-    "닭고기": "닭고기", "버섯": "버섯", "시금치": "시금치", "콩나물": "콩나물",
-}
+# 재료 인식 사전은 더 이상 하드코딩하지 않고, 매 요청마다 req.ingredient_dictionary로 전달받는다
+# (Spring이 ingredients + ingredient_aliases 테이블 전체를 실어 보냄).
 
-# 특정 재료가 없을 때 대신 쓸 수 있는 재료 추천 문구용 사전
+# 특정 재료가 없을 때 대신 쓸 수 있는 재료 추천 문구용 사전.
+# 이건 재료 "인식"이 아니라 레시피 추천 문구 생성용이라 별개로 소규모 유지.
 SUBSTITUTES = {
     "참치": ["햄", "스팸", "계란"], "햄": ["참치", "스팸"], "계란": ["두부", "햄"],
     "두부": ["계란", "햄"], "김치": ["양파+고춧가루"], "식빵": ["밥", "또띠아"],
@@ -83,27 +88,35 @@ SUBSTITUTES = {
 NOUN_TAGS = {"NNG", "NNP"}
 
 
-def normalize_ingredients(text: str) -> list[str]:
-    """문장에서 명사 토큰만 뽑아, 사전에 등록된 재료명이면 표준 이름으로 변환해 모은다.
-    예: "달걀"이 나오면 표준 재료명인 "계란"으로 바뀜."""
+def build_dictionary_lookup(entries: list[IngredientDictionaryEntry]) -> dict[str, tuple[int, str]]:
+    """[{term, ingredient_id, canonical_name}, ...] -> {term: (ingredient_id, canonical_name)}"""
+    return {e.term: (e.ingredient_id, e.canonical_name) for e in entries}
+
+
+def normalize_ingredients(text: str, lookup: dict[str, tuple[int, str]]) -> list[tuple[int, str]]:
+    """문장에서 명사 토큰만 뽑아, 사전에 등록된 재료명이면 (id, 표준 이름)으로 변환해 모은다.
+    예: "달걀"이 나오면 (3020, "계란")으로 바뀜. 재료 id 기준으로 중복 제거한다
+    (예: "계란"과 "달걀"이 둘 다 나와도 한 번만 잡힘)."""
     tokens = kiwi.tokenize(text)
-    found = set()
+    found: dict[int, str] = {}
     for t in tokens:
-        if t.tag in NOUN_TAGS and t.form in INGREDIENT_ALIASES:
-            found.add(INGREDIENT_ALIASES[t.form])
-    return list(found)
+        if t.tag in NOUN_TAGS and t.form in lookup:
+            ingredient_id, canonical_name = lookup[t.form]
+            found[ingredient_id] = canonical_name
+    return list(found.items())
 
 
-def parse_quantities(text: str) -> list[dict]:
+def parse_quantities(text: str, lookup: dict[str, tuple[int, str]]) -> list[dict]:
     """숫자(SN) 토큰을 기준으로, 그 앞에 나온 가장 가까운 명사를 재료명으로,
     바로 뒤에 오는 단위명사(NNB, 예: "개")나 외국어 단위(SL, 예: "g")를 단위로 묶는다.
+    명사가 사전에 있는 별칭이면 표준 이름으로 바꿔서 저장한다 (parsed_ingredients와 이름을 맞추기 위함).
     예: "계란/NNG 2/SN 개/NNB" -> {"name": "계란", "qty": 2.0, "unit": "개"}"""
     tokens = kiwi.tokenize(text)
     quantities = []
-    last_noun = None  # 지금까지 본 토큰 중 가장 최근의 명사를 기억해둔다
+    last_noun = None  # 지금까지 본 토큰 중 가장 최근의 명사를 기억해둔다 (표준화된 이름 우선)
     for i, t in enumerate(tokens):
         if t.tag in NOUN_TAGS:
-            last_noun = t.form
+            last_noun = lookup[t.form][1] if t.form in lookup else t.form
         elif t.tag == "SN" and last_noun:
             # 숫자 바로 다음 토큰이 단위를 나타내면 그 글자를 단위로 사용, 아니면 빈 문자열
             unit = tokens[i + 1].form if i + 1 < len(tokens) and tokens[i + 1].tag in ("NNB", "SL") else ""
@@ -184,22 +197,26 @@ def pick_best(
 
 @router.post("", response_model=RecommendResponse, summary="재료 기반 셰프별 레시피 추천")
 def recommend(req: RecommendRequest):
-    # 1. 입력 텍스트에서 표준 재료명 / 수량 정보를 뽑아낸다
-    ingredients = normalize_ingredients(req.raw_ingredients_text)
-    quantities = parse_quantities(req.raw_ingredients_text)
+    # 1. 재료 인식 사전을 요청에서 조립하고, 입력 텍스트에서 표준 재료명/ID·수량 정보를 뽑아낸다
+    lookup = build_dictionary_lookup(req.ingredient_dictionary)
+    normalized = normalize_ingredients(req.raw_ingredients_text, lookup)  # [(id, name), ...]
+    ingredient_ids = [i for i, _ in normalized]
+    ingredient_names = [n for _, n in normalized]
+    quantities = parse_quantities(req.raw_ingredients_text, lookup)
 
     # 2. 셰프(한식/중식/양식) 각각에 대해 가장 잘 맞는 레시피 1개씩 선정
     results: dict[str, RecipeResult | None] = {}
     for chef_code in ("KOREAN", "CHINESE", "WESTERN"):
         excluded_ids = req.exclude_recipe_ids.get(chef_code, [])
         results[chef_code] = pick_best(
-            req.candidate_recipes, chef_code, ingredients, quantities,
+            req.candidate_recipes, chef_code, ingredient_names, quantities,
             req.exclude_ingredients, excluded_ids,
         )
 
     # 3. 응답 조립 (재료를 하나도 못 찾았으면 안내용 기본값 사용)
     return RecommendResponse(
-        parsed_ingredients=ingredients or ["입력 재료"],
-        portion_hint=portion_hint(ingredients, quantities),
+        parsed_ingredients=ingredient_names or ["입력 재료"],
+        normalized_ingredient_ids=ingredient_ids,
+        portion_hint=portion_hint(ingredient_names, quantities),
         results=results,
     )
